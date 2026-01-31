@@ -367,6 +367,57 @@ def _now_iso8601() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def collect_responses_sse(upstream, *, verbose: bool = False, vlog=None) -> tuple[Dict[str, Any] | None, str | None]:
+    response_obj: Dict[str, Any] | None = None
+    error_message: str | None = None
+    try:
+        try:
+            line_iterator = upstream.iter_lines(decode_unicode=False)
+        except requests.exceptions.ChunkedEncodingError as e:
+            if verbose and vlog:
+                vlog(f"Failed to start stream: {e}")
+            return None, "stream_failed"
+
+        for raw in line_iterator:
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else raw
+            if verbose and vlog:
+                vlog(line)
+            if not line.startswith("data: "):
+                continue
+            data = line[len("data: ") :].strip()
+            if not data:
+                continue
+            if data == "[DONE]":
+                break
+            try:
+                evt = json.loads(data)
+            except Exception:
+                continue
+            kind = evt.get("type")
+            if kind == "response.completed":
+                response_obj = evt.get("response") if isinstance(evt.get("response"), dict) else None
+                break
+            if kind == "response.failed":
+                response_obj = evt.get("response") if isinstance(evt.get("response"), dict) else None
+                error_message = (evt.get("response", {}) or {}).get("error", {}).get("message") or "response.failed"
+                break
+            if kind == "response.incomplete":
+                response_obj = evt.get("response") if isinstance(evt.get("response"), dict) else None
+                reason = (evt.get("response", {}) or {}).get("incomplete_details", {}).get("reason")
+                error_message = f"response.incomplete: {reason}" if reason else "response.incomplete"
+                break
+            if kind == "error":
+                error_message = evt.get("message") or "error"
+                break
+            if isinstance(evt.get("response"), dict):
+                response_obj = evt.get("response")
+    finally:
+        upstream.close()
+    return response_obj, error_message
+
+
 def get_effective_chatgpt_auth() -> tuple[str | None, str | None]:
     access_token, account_id, id_token = load_chatgpt_tokens()
     if not account_id:

@@ -144,7 +144,7 @@ def _poll_async_status(
     all_file_ids: List[str] = []
     last_file_id: Optional[str] = None
     stable_count = 0
-    required_stable = 15 if wait_for_stable else 1
+    required_stable = 5 if wait_for_stable else 1
 
     for attempt in range(max_attempts):
         # Try fetching conversation details
@@ -735,11 +735,15 @@ def create_image() -> Response:
         "data": data,
     }
 
-    # Clean up: delete the conversation to avoid cluttering history
-    if conversation_id and data:
-        if verbose:
-            print(f"  Cleaning up conversation {conversation_id}...")
-        _delete_conversation(conversation_id, access_token, account_id, verbose=verbose)
+    # Clean up: delete the conversation(s) to avoid cluttering history
+    if data:
+        conv_ids = {info.get("conversation_id") for info in image_infos if info.get("conversation_id")}
+        if conversation_id:
+            conv_ids.add(conversation_id)
+        for conv_id in sorted({cid for cid in conv_ids if isinstance(cid, str) and cid.strip()}):
+            if verbose:
+                print(f"  Cleaning up conversation {conv_id}...")
+            _delete_conversation(conv_id, access_token, account_id, verbose=verbose)
 
     if verbose:
         _log_json("OUT POST /v1/images/generations", response)

@@ -87,6 +87,24 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
+### Responses API (Python)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="key"  # ignored
+)
+
+resp = client.responses.create(
+    model="gpt-5",
+    input="hello world"
+)
+
+print(resp.output[0].content[0].text)
+```
+
 ### curl
 
 ```bash
@@ -96,6 +114,18 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{
     "model": "gpt-5",
     "messages": [{"role":"user","content":"hello world"}]
+  }'
+```
+
+### Responses API (curl)
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Authorization: Bearer key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5",
+    "input": "hello world"
   }'
 ```
 
@@ -114,6 +144,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 # Supported models
 - `gpt-5`
+- `gpt-5-mini` (aliases to `gpt-5.2` when using ChatGPT account)
 - `gpt-5.1`
 - `gpt-5.2`
 - `gpt-5-codex`

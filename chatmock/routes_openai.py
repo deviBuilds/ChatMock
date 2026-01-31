@@ -17,6 +17,7 @@ from .reasoning import (
 )
 from .upstream import normalize_model_name, start_upstream_request
 from .utils import (
+    collect_responses_sse,
     convert_chat_messages_to_responses_input,
     convert_tools_chat_to_responses,
     sse_translate_chat,
@@ -368,6 +369,253 @@ def chat_completions() -> Response:
     return resp
 
 
+@openai_bp.route("/v1/responses", methods=["POST"])
+def responses() -> Response:
+    verbose = bool(current_app.config.get("VERBOSE"))
+    reasoning_effort = current_app.config.get("REASONING_EFFORT", "medium")
+    reasoning_summary = current_app.config.get("REASONING_SUMMARY", "auto")
+    debug_model = current_app.config.get("DEBUG_MODEL")
+
+    raw = request.get_data(cache=True, as_text=True) or ""
+    if verbose:
+        try:
+            print("IN POST /v1/responses\n" + raw)
+        except Exception:
+            pass
+    try:
+        payload = json.loads(raw) if raw else {}
+    except Exception:
+        try:
+            payload = json.loads(raw.replace("\r", "").replace("\n", ""))
+        except Exception:
+            err = {"error": {"message": "Invalid JSON body"}}
+            if verbose:
+                _log_json("OUT POST /v1/responses", err)
+            return jsonify(err), 400
+
+    requested_model = payload.get("model")
+    model = normalize_model_name(requested_model, debug_model)
+
+    input_items = payload.get("input")
+    if input_items is None and isinstance(payload.get("messages"), list):
+        input_items = convert_chat_messages_to_responses_input(payload.get("messages"))
+    if input_items is None and isinstance(payload.get("prompt"), str):
+        input_items = payload.get("prompt")
+    if isinstance(input_items, str):
+        input_items = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": input_items}],
+            }
+        ]
+    if input_items is None:
+        input_items = []
+    if not isinstance(input_items, list):
+        err = {"error": {"message": "Request must include input: []"}}
+        if verbose:
+            _log_json("OUT POST /v1/responses", err)
+        return jsonify(err), 400
+    if input_items:
+        normalized: List[Dict[str, Any]] = []
+        needs_wrap = False
+        for item in input_items:
+            if not isinstance(item, dict):
+                normalized.append(item)
+                continue
+            if "type" not in item and "role" in item and "content" in item:
+                needs_wrap = True
+                normalized.append(
+                    {
+                        "type": "message",
+                        "role": item.get("role"),
+                        "content": item.get("content"),
+                    }
+                )
+            else:
+                normalized.append(item)
+        if needs_wrap:
+            input_items = normalized
+
+    is_stream = bool(payload.get("stream"))
+
+    tools_payload = payload.get("tools")
+    tools_responses: List[Dict[str, Any]] = []
+    if isinstance(tools_payload, list):
+        needs_convert = any(isinstance(t, dict) and "function" in t for t in tools_payload)
+        tools_responses = convert_tools_chat_to_responses(tools_payload) if needs_convert else tools_payload
+
+    tool_choice = payload.get("tool_choice", "auto")
+    parallel_tool_calls = bool(payload.get("parallel_tool_calls", False))
+    responses_tools_payload = payload.get("responses_tools") if isinstance(payload.get("responses_tools"), list) else []
+    extra_tools: List[Dict[str, Any]] = []
+    had_responses_tools = False
+    if isinstance(responses_tools_payload, list):
+        for _t in responses_tools_payload:
+            if not (isinstance(_t, dict) and isinstance(_t.get("type"), str)):
+                continue
+            if _t.get("type") not in ("web_search", "web_search_preview"):
+                err = {
+                    "error": {
+                        "message": "Only web_search/web_search_preview are supported in responses_tools",
+                        "code": "RESPONSES_TOOL_UNSUPPORTED",
+                    }
+                }
+                if verbose:
+                    _log_json("OUT POST /v1/responses", err)
+                return jsonify(err), 400
+            extra_tools.append(_t)
+
+        if not extra_tools and bool(current_app.config.get("DEFAULT_WEB_SEARCH")):
+            responses_tool_choice = payload.get("responses_tool_choice")
+            if not (isinstance(responses_tool_choice, str) and responses_tool_choice == "none"):
+                extra_tools = [{"type": "web_search"}]
+
+        if extra_tools:
+            import json as _json
+
+            MAX_TOOLS_BYTES = 32768
+            try:
+                size = len(_json.dumps(extra_tools))
+            except Exception:
+                size = 0
+            if size > MAX_TOOLS_BYTES:
+                err = {"error": {"message": "responses_tools too large", "code": "RESPONSES_TOOLS_TOO_LARGE"}}
+                if verbose:
+                    _log_json("OUT POST /v1/responses", err)
+                return jsonify(err), 400
+            had_responses_tools = True
+            tools_responses = (tools_responses or []) + extra_tools
+
+    responses_tool_choice = payload.get("responses_tool_choice")
+    if isinstance(responses_tool_choice, str) and responses_tool_choice in ("auto", "none"):
+        tool_choice = responses_tool_choice
+
+    instructions = payload.get("instructions")
+    if not (isinstance(instructions, str) and instructions.strip()):
+        instructions = _instructions_for_model(model)
+
+    model_reasoning = extract_reasoning_from_model_name(requested_model)
+    reasoning_overrides = payload.get("reasoning") if isinstance(payload.get("reasoning"), dict) else model_reasoning
+    reasoning_param = build_reasoning_param(
+        reasoning_effort,
+        reasoning_summary,
+        reasoning_overrides,
+        allowed_efforts=allowed_efforts_for_model(model),
+    )
+
+    upstream, error_resp = start_upstream_request(
+        model,
+        input_items,
+        instructions=instructions,
+        tools=tools_responses,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
+        reasoning_param=reasoning_param,
+    )
+    if error_resp is not None:
+        if verbose:
+            try:
+                body = error_resp.get_data(as_text=True)
+                if body:
+                    try:
+                        parsed = json.loads(body)
+                    except Exception:
+                        parsed = body
+                    _log_json("OUT POST /v1/responses", parsed)
+            except Exception:
+                pass
+        return error_resp
+
+    record_rate_limits_from_response(upstream)
+
+    if upstream.status_code >= 400:
+        try:
+            raw_body = upstream.content
+            err_body = json.loads(raw_body.decode("utf-8", errors="ignore")) if raw_body else {"raw": upstream.text}
+        except Exception:
+            err_body = {"raw": upstream.text}
+        if had_responses_tools:
+            if verbose:
+                print("[Passthrough] Upstream rejected tools; retrying without extra tools (args redacted)")
+            if isinstance(tools_payload, list):
+                needs_convert = any(isinstance(t, dict) and "function" in t for t in tools_payload)
+                base_tools_only = convert_tools_chat_to_responses(tools_payload) if needs_convert else tools_payload
+            else:
+                base_tools_only = []
+            safe_choice = payload.get("tool_choice", "auto")
+            upstream2, err2 = start_upstream_request(
+                model,
+                input_items,
+                instructions=instructions,
+                tools=base_tools_only,
+                tool_choice=safe_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                reasoning_param=reasoning_param,
+            )
+            record_rate_limits_from_response(upstream2)
+            if err2 is None and upstream2 is not None and upstream2.status_code < 400:
+                upstream = upstream2
+            else:
+                err = {
+                    "error": {
+                        "message": (err_body.get("error", {}) or {}).get("message", "Upstream error"),
+                        "code": "RESPONSES_TOOLS_REJECTED",
+                    }
+                }
+                if verbose:
+                    _log_json("OUT POST /v1/responses", err)
+                return jsonify(err), (upstream2.status_code if upstream2 is not None else upstream.status_code)
+        else:
+            if verbose:
+                print("Upstream error status=", upstream.status_code)
+            err_msg = (
+                (err_body.get("error", {}) or {}).get("message")
+                or err_body.get("message")
+                or err_body.get("detail")
+                or err_body.get("raw")
+                or "Upstream error"
+            )
+            err = {"error": {"message": err_msg}}
+            if verbose:
+                _log_json("OUT POST /v1/responses", err)
+            return jsonify(err), upstream.status_code
+
+    if is_stream:
+        if verbose:
+            print("OUT POST /v1/responses (streaming response)")
+        stream_iter = upstream.iter_content(chunk_size=None)
+        stream_iter = _wrap_stream_logging("STREAM OUT /v1/responses", stream_iter, verbose)
+        resp = Response(
+            stream_iter,
+            status=upstream.status_code,
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+        for k, v in build_cors_headers().items():
+            resp.headers.setdefault(k, v)
+        return resp
+
+    response_obj, error_message = collect_responses_sse(upstream, verbose=verbose, vlog=print if verbose else None)
+    if error_message:
+        err = {"error": {"message": error_message}}
+        if verbose:
+            _log_json("OUT POST /v1/responses", err)
+        return jsonify(err), 502
+    if not isinstance(response_obj, dict):
+        err = {"error": {"message": "Empty response"}}
+        if verbose:
+            _log_json("OUT POST /v1/responses", err)
+        return jsonify(err), 502
+
+    if verbose:
+        _log_json("OUT POST /v1/responses", response_obj)
+    resp = make_response(jsonify(response_obj), upstream.status_code)
+    for k, v in build_cors_headers().items():
+        resp.headers.setdefault(k, v)
+    return resp
+
+
 @openai_bp.route("/v1/completions", methods=["POST"])
 def completions() -> Response:
     verbose = bool(current_app.config.get("VERBOSE"))
@@ -533,6 +781,7 @@ def list_models() -> Response:
     expose_variants = bool(current_app.config.get("EXPOSE_REASONING_MODELS"))
     model_groups = [
         ("gpt-5", ["high", "medium", "low", "minimal"]),
+        ("gpt-5-mini", []),
         ("gpt-5.1", ["high", "medium", "low"]),
         ("gpt-5.2", ["xhigh", "high", "medium", "low"]),
         ("gpt-5-codex", ["high", "medium", "low"]),

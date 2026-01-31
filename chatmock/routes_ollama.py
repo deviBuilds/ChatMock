@@ -95,6 +95,7 @@ def ollama_tags() -> Response:
     expose_variants = bool(current_app.config.get("EXPOSE_REASONING_MODELS"))
     model_ids = [
         "gpt-5",
+        "gpt-5-mini",
         "gpt-5.1",
         "gpt-5.2",
         "gpt-5-codex",
